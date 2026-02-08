@@ -44,6 +44,38 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	echoServer.HideBanner = true
 	echoServer.HidePort = true
 	echoServer.Use(middleware.Recover())
+
+	// Add security headers middleware
+	echoServer.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Set security headers
+			c.Response().Header().Set("X-Frame-Options", "DENY")
+			c.Response().Header().Set("X-Content-Type-Options", "nosniff")
+			c.Response().Header().Set("X-XSS-Protection", "1; mode=block")
+			c.Response().Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			c.Response().Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+			// Set CSP header
+			// Note: 'unsafe-inline' and 'unsafe-eval' are needed for React and admin custom scripts
+			// In production, consider using nonces for inline scripts
+			csp := "default-src 'self'; " +
+				"script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+				"style-src 'self' 'unsafe-inline'; " +
+				"img-src 'self' data: https:; " +
+				"font-src 'self' data:; " +
+				"connect-src 'self'; " +
+				"frame-ancestors 'none';"
+			c.Response().Header().Set("Content-Security-Policy", csp)
+
+			// Set HSTS header for HTTPS connections
+			if c.Request().TLS != nil || c.Request().Header.Get("X-Forwarded-Proto") == "https" {
+				c.Response().Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			}
+
+			return next(c)
+		}
+	})
+
 	s.echoServer = echoServer
 
 	instanceBasicSetting, err := s.getOrUpsertInstanceBasicSetting(ctx)
@@ -51,9 +83,14 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 		return nil, errors.Wrap(err, "failed to get instance basic setting")
 	}
 
-	secret := "usememos"
-	if !profile.Demo {
-		secret = instanceBasicSetting.SecretKey
+	// Use instance secret key for JWT signing
+	// In demo mode, still use a random secret for security, but log a warning
+	secret := instanceBasicSetting.SecretKey
+	if profile.Demo {
+		// Generate a random secret for demo mode instead of using hardcoded value
+		// This prevents JWT forgery attacks against demo instances
+		secret = uuid.NewString()
+		slog.Warn("Demo mode enabled: Using ephemeral JWT secret. All tokens will be invalidated on restart.")
 	}
 	s.Secret = secret
 

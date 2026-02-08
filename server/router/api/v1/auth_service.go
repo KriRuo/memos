@@ -60,8 +60,18 @@ func (s *APIV1Service) GetCurrentUser(ctx context.Context, _ *v1pb.GetCurrentUse
 // 2. SSO authentication (OAuth2 authorization code).
 //
 // Authentication: Not required (public endpoint).
+// Rate Limited: 5 attempts per 15 minutes per IP address.
 // Returns: User info, access token, and token expiry.
 func (s *APIV1Service) SignIn(ctx context.Context, request *v1pb.SignInRequest) (*v1pb.SignInResponse, error) {
+	// Apply rate limiting to prevent brute-force attacks
+	clientIP := getClientIPFromContext(ctx)
+	if !s.authRateLimiter.Allow(clientIP) {
+		slog.Warn("rate limit exceeded for sign in",
+			"ip", clientIP,
+			"method", "SignIn")
+		return nil, status.Errorf(codes.ResourceExhausted, "too many authentication attempts, please try again later")
+	}
+
 	var existingUser *store.User
 
 	// Authentication Method 1: Password-based authentication
@@ -73,10 +83,20 @@ func (s *APIV1Service) SignIn(ctx context.Context, request *v1pb.SignInRequest) 
 			return nil, status.Errorf(codes.Internal, "failed to get user, error: %v", err)
 		}
 		if user == nil {
+			// Log failed authentication attempt
+			slog.Warn("authentication failed",
+				"username", passwordCredentials.Username,
+				"ip", clientIP,
+				"reason", "user_not_found")
 			return nil, status.Errorf(codes.InvalidArgument, unmatchedUsernameAndPasswordError)
 		}
 		// Compare the stored hashed password, with the hashed version of the password that was received.
 		if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(passwordCredentials.Password)); err != nil {
+			// Log failed authentication attempt
+			slog.Warn("authentication failed",
+				"username", passwordCredentials.Username,
+				"ip", clientIP,
+				"reason", "invalid_password")
 			return nil, status.Errorf(codes.InvalidArgument, unmatchedUsernameAndPasswordError)
 		}
 		instanceGeneralSetting, err := s.Store.GetInstanceGeneralSetting(ctx)
@@ -85,6 +105,10 @@ func (s *APIV1Service) SignIn(ctx context.Context, request *v1pb.SignInRequest) 
 		}
 		// Check if the password auth in is allowed.
 		if instanceGeneralSetting.DisallowPasswordAuth && user.Role == store.RoleUser {
+			slog.Warn("authentication failed",
+				"username", passwordCredentials.Username,
+				"ip", clientIP,
+				"reason", "password_auth_disabled")
 			return nil, status.Errorf(codes.PermissionDenied, "password signin is not allowed")
 		}
 		existingUser = user
@@ -364,6 +388,33 @@ func (s *APIV1Service) clearAuthCookies(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// getClientIPFromContext extracts the client IP address from the request context.
+// It checks X-Forwarded-For and X-Real-IP headers first (for reverse proxy setups),
+// then falls back to the direct connection IP.
+func getClientIPFromContext(ctx context.Context) string {
+	// Try to get IP from gRPC metadata (set by proxies)
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		// Check X-Forwarded-For header
+		if xff := md.Get("x-forwarded-for"); len(xff) > 0 && xff[0] != "" {
+			// X-Forwarded-For can contain multiple IPs, take the first one
+			parts := strings.Split(xff[0], ",")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[0])
+			}
+		}
+		// Check X-Real-IP header
+		if xri := md.Get("x-real-ip"); len(xri) > 0 && xri[0] != "" {
+			return xri[0]
+		}
+		// Check direct peer address from gRPC
+		if peer := md.Get(":authority"); len(peer) > 0 && peer[0] != "" {
+			return peer[0]
+		}
+	}
+	// Fallback to unknown if we can't determine IP
+	return "unknown"
 }
 
 func (*APIV1Service) buildRefreshTokenCookie(ctx context.Context, refreshToken string, expireTime time.Time) string {
