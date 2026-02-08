@@ -99,6 +99,11 @@ const InstanceSection = () => {
         </SettingRow>
 
         <SettingRow label={t("setting.system-section.additional-script")} vertical>
+          <div className="mb-2 rounded-md border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800 dark:border-yellow-700 dark:bg-yellow-950 dark:text-yellow-200">
+            <strong>⚠️ Security Warning:</strong> This feature allows arbitrary JavaScript execution in all users&apos; browsers.
+            Only use if you fully understand the security implications. Malicious scripts can steal credentials, hijack sessions,
+            or compromise user data.
+          </div>
           <Textarea
             className="font-mono w-full"
             rows={3}

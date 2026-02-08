@@ -3,12 +3,15 @@ package v1
 import (
 	"context"
 	"net/http"
+	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 
 	"github.com/usememos/memos/internal/profile"
 	"github.com/usememos/memos/plugin/markdown"
@@ -34,18 +37,26 @@ type APIV1Service struct {
 
 	// thumbnailSemaphore limits concurrent thumbnail generation to prevent memory exhaustion
 	thumbnailSemaphore *semaphore.Weighted
+
+	// authRateLimiter limits authentication attempts to prevent brute-force attacks
+	// Default: 5 requests per 15 minutes per IP address
+	authRateLimiter *RateLimiter
 }
 
 func NewAPIV1Service(secret string, profile *profile.Profile, store *store.Store) *APIV1Service {
 	markdownService := markdown.NewService(
 		markdown.WithTagExtension(),
 	)
+	// Create rate limiter: 5 requests per 15 minutes = 5/(15*60) = 1/180 per second
+	authRateLimiter := NewRateLimiter(rate.Every(15*time.Minute)/5, 5)
+
 	return &APIV1Service{
 		Secret:             secret,
 		Profile:            profile,
 		Store:              store,
 		MarkdownService:    markdownService,
 		thumbnailSemaphore: semaphore.NewWeighted(3), // Limit to 3 concurrent thumbnail generations
+		authRateLimiter:    authRateLimiter,
 	}
 }
 
@@ -138,9 +149,26 @@ func (s *APIV1Service) RegisterGateway(ctx context.Context, echoServer *echo.Ech
 	connectHandler.RegisterConnectHandlers(connectMux, connectInterceptors)
 
 	// Wrap with CORS for browser access
+	// Only allow requests from the configured instance URL and localhost (for development)
 	corsHandler := middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOriginFunc: func(_ string) (bool, error) {
-			return true, nil
+		AllowOriginFunc: func(origin string) (bool, error) {
+			// Allow localhost for development
+			if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
+				return true, nil
+			}
+			// Allow configured instance URL
+			if s.Profile.InstanceURL != "" {
+				instanceOrigin := strings.TrimSuffix(s.Profile.InstanceURL, "/")
+				if origin == instanceOrigin {
+					return true, nil
+				}
+			}
+			// In demo mode, be more permissive for testing
+			if s.Profile.Demo {
+				return true, nil
+			}
+			// Deny all other origins
+			return false, nil
 		},
 		AllowMethods:     []string{http.MethodGet, http.MethodPost, http.MethodOptions},
 		AllowHeaders:     []string{"*"},
